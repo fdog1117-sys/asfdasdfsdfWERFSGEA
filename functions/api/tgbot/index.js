@@ -20,6 +20,7 @@
  */
 
 import { getDatabase } from '../../utils/databaseAdapter.js';
+import { fetchUploadConfig, fetchSecurityConfig } from '../../utils/sysConfig.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram API 工具函数
@@ -202,10 +203,16 @@ async function doUpload(context, pending, arrayBuffer, originUrl) {
     uploadUrl.searchParams.set('uploadChannel', 'telegram');
 
     // ── 认证处理 ─────────────────────────────────────────────────────────────
-    // 优先使用 TG_UPLOAD_AUTH_CODE（专用上传认证码），其次从 URL 获取当前认证码
-    const authCode = env.TG_UPLOAD_AUTH_CODE || '';
+    // 优先使用环境变量，其次从数据库中获取系统安全配置的用户认证码
+    let authCode = env.TG_UPLOAD_AUTH_CODE || '';
+    if (!authCode) {
+        try {
+            const securityConfig = await fetchSecurityConfig(env);
+            authCode = securityConfig.auth?.user?.authCode || '';
+        } catch (e) {}
+    }
+
     if (authCode) {
-        // 作为 URL 参数传递 authCode（图床认证核心会从 URL 中提取）
         uploadUrl.searchParams.set('authCode', authCode);
     }
 
@@ -309,13 +316,29 @@ export async function onRequest(context) {
         }
     }
 
-    const botToken = env.TG_BOT_TOKEN;
+    const db = getDatabase(env);
+
+    // ── 从环境变量或数据库中读取 Bot 配置 ──────────────────────────────────────
+    let botToken = env.TG_BOT_TOKEN || '';
+    let proxyUrl = env.TG_PROXY_URL || '';
+
     if (!botToken) {
-        return new Response('TG_BOT_TOKEN not configured', { status: 500 });
+        try {
+            const uploadConfig = await fetchUploadConfig(env);
+            const tgChannels = uploadConfig.telegram?.channels || [];
+            if (tgChannels.length > 0) {
+                botToken = tgChannels[0].botToken || '';
+                proxyUrl = tgChannels[0].proxyUrl || '';
+            }
+        } catch (e) {
+            console.error('[TgBot] Failed to fetch upload config:', e);
+        }
     }
 
-    const proxyUrl = env.TG_PROXY_URL || '';
-    const db = getDatabase(env);
+    if (!botToken) {
+        return new Response('Telegram Bot Token 未配置（环境变量或管理面板图床设置中均未找到）', { status: 500 });
+    }
+
     const originUrl = new URL(request.url).origin;
 
     let update;

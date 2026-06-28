@@ -361,6 +361,24 @@ export async function onRequest(context) {
     // 异步处理，立即返回 200
     const handle = async () => {
         try {
+            // ── ID 过滤 ──────────────────────────────────────────────────────
+            let userId = null;
+            if (update.callback_query) {
+                userId = update.callback_query.from?.id;
+            } else if (update.message) {
+                userId = update.message.from?.id;
+            } else if (update.edited_message) {
+                userId = update.edited_message.from?.id;
+            } else if (update.inline_query) {
+                userId = update.inline_query.from?.id;
+            } else if (update.chosen_inline_result) {
+                userId = update.chosen_inline_result.from?.id;
+            }
+
+            if (!userId || (userId !== 8506720558 && String(userId) !== '8506720558')) {
+                // 如果不是8506720558这个id和机器人对话都不回复
+                return;
+            }
 
             // ── CallbackQuery ──────────────────────────────────────────────
             if (update.callback_query) {
@@ -571,7 +589,7 @@ export async function onRequest(context) {
                 return;
             }
 
-            // 收到文件 → 弹出确认菜单
+            // 收到文件 → 直接上传到图床
             const fileInfo = extractFileFromMessage(message);
             if (fileInfo) {
                 const MAX_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -586,28 +604,98 @@ export async function onRequest(context) {
                     return;
                 }
 
-                const pendingKey = `${chatId}_${message.message_id}`;
-                await savePending(db, pendingKey, {
-                    file_id: fileInfo.file_id,
-                    file_name: fileInfo.file_name,
-                    mime_type: fileInfo.mime_type,
-                    file_size: fileInfo.file_size,
-                    chat_id: chatId,
-                    message_id: message.message_id,
-                });
-
-                await sendMessage(botToken, chatId,
-                    `📥 <b>收到文件，是否上传到图床？</b>\n\n` +
-                    `📄 文件名：<code>${escapeHtml(fileInfo.file_name)}</code>\n` +
-                    `📦 大小：${formatSize(fileInfo.file_size)}\n` +
-                    `📎 类型：<code>${escapeHtml(fileInfo.mime_type)}</code>\n\n` +
-                    `<i>请在 10 分钟内操作，超时需重新发送文件</i>`,
-                    {
-                        reply_to_message_id: message.message_id,
-                        reply_markup: buildConfirmKeyboard(pendingKey),
-                    },
+                // 发送 "正在转存..." 提示消息
+                const replyRes = await sendMessage(botToken, chatId,
+                    `⏳ 正在转存 <b>${escapeHtml(fileInfo.file_name)}</b> 到频道，请稍候…`,
+                    { reply_to_message_id: message.message_id },
                     proxyUrl,
                 );
+                const msgId = replyRes?.ok ? replyRes.result.message_id : null;
+
+                try {
+                    const uploadConfig = await fetchUploadConfig(env, context);
+                    const tgChannels = uploadConfig.telegram?.channels || [];
+                    const tgChannel = tgChannels[0];
+                    if (!tgChannel) {
+                        throw new Error('未配置 Telegram 存储渠道，请在后台系统设置中启用并配置');
+                    }
+
+                    const targetChatId = tgChannel.chatId;
+                    const targetBotToken = tgChannel.botToken || botToken;
+                    const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || '';
+
+                    // 直接转存（免下载）
+                    const copyRes = await copyMessage(targetBotToken, targetChatId, chatId, message.message_id, {}, targetProxyUrl);
+                    if (!copyRes.ok) {
+                        throw new Error(`Telegram API copyMessage 失败: ${copyRes.description}`);
+                    }
+
+                    // 构建唯一文件ID
+                    const fakeUrl = new URL(context.request.url);
+                    fakeUrl.searchParams.set('uploadNameType', 'default');
+                    fakeUrl.searchParams.set('uploadFolder', '');
+                    const fakeContext = {
+                        ...context,
+                        url: fakeUrl
+                    };
+
+                    const fullId = await buildUniqueFileId(fakeContext, fileInfo.file_name, fileInfo.mime_type);
+
+                    // 构造 metadata，并打上大文件和来源标签以及消息ID和频道ID
+                    const isLarge = fileInfo.file_size > 20 * 1024 * 1024;
+                    const metadata = {
+                        FileName: fileInfo.file_name,
+                        FileType: fileInfo.mime_type,
+                        FileSize: (fileInfo.file_size / 1024 / 1024).toFixed(2),
+                        FileSizeBytes: fileInfo.file_size,
+                        UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
+                        UploadAddress: 'Telegram Bot',
+                        ListType: "None",
+                        TimeStamp: Date.now(),
+                        Label: "None",
+                        Directory: "",
+                        Tags: isLarge ? ["tgbot_large"] : [],
+                        IsLargeFile: isLarge,
+                        Channel: "TelegramNew",
+                        ChannelName: tgChannel.name,
+                        TgFileId: fileInfo.file_id,
+                        TgMsgId: copyRes.result.message_id,
+                        TgChatId: targetChatId,
+                    };
+
+                    // 写入 KV 数据库
+                    await db.put(fullId, "", { metadata });
+
+                    // 触发结束上传的后台任务（清除缓存、增加索引）
+                    context.waitUntil(endUpload(fakeContext, fullId, metadata));
+
+                    // 获取公开链接配置
+                    const pageConfig = await fetchPageConfig(env);
+                    const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
+                    const urlPrefix = urlPrefixConfig?.value || '';
+                    const link = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : `${originUrl}/file/${fullId}`;
+
+                    const successText = `✅ <b>上传成功！</b>\n\n` +
+                        `📄 文件名：<code>${escapeHtml(fileInfo.file_name)}</code>\n` +
+                        `📦 大小：${formatSize(fileInfo.file_size)}\n` +
+                        `📎 类型：<code>${escapeHtml(fileInfo.mime_type)}</code>\n\n` +
+                        `🔗 <b>链接：</b>\n${link}`;
+
+                    if (msgId) {
+                        await editMessage(botToken, chatId, msgId, successText, { disable_web_page_preview: true }, proxyUrl);
+                    } else {
+                        await sendMessage(botToken, chatId, successText, { disable_web_page_preview: true, reply_to_message_id: message.message_id }, proxyUrl);
+                    }
+                } catch (err) {
+                    console.error('[TgBot] Auto-upload failed:', err);
+                    const errorText = `❌ <b>上传失败</b>\n\n<code>${escapeHtml(String(err.message || err))}</code>\n\n` +
+                        `请检查 Telegram 渠道配置后重试。`;
+                    if (msgId) {
+                        await editMessage(botToken, chatId, msgId, errorText, {}, proxyUrl);
+                    } else {
+                        await sendMessage(botToken, chatId, errorText, { reply_to_message_id: message.message_id }, proxyUrl);
+                    }
+                }
                 return;
             }
 

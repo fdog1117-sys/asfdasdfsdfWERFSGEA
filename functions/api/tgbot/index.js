@@ -20,7 +20,8 @@
  */
 
 import { getDatabase } from '../../utils/databaseAdapter.js';
-import { fetchUploadConfig, fetchSecurityConfig } from '../../utils/sysConfig.js';
+import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig } from '../../utils/sysConfig.js';
+import { buildUniqueFileId, endUpload, resolveFileExt } from '../../upload/uploadTools.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram API 工具函数
@@ -59,6 +60,15 @@ async function answerCallback(botToken, callbackQueryId, text = '', proxyUrl = '
     return tgCall(botToken, 'answerCallbackQuery', {
         callback_query_id: callbackQueryId,
         text,
+    }, proxyUrl);
+}
+
+async function copyMessage(botToken, chatId, fromChatId, messageId, options = {}, proxyUrl = '') {
+    return tgCall(botToken, 'copyMessage', {
+        chat_id: chatId,
+        from_chat_id: fromChatId,
+        message_id: messageId,
+        ...options,
     }, proxyUrl);
 }
 
@@ -374,7 +384,7 @@ export async function onRequest(context) {
                         '/start — 打开主菜单\n' +
                         '/list  — 最近上传的文件\n' +
                         '/help  — 显示此帮助\n\n' +
-                        '<i>⚠️ 单文件最大 20 MB（Telegram Bot API 限制）</i>',
+                        '<i>⚠️ 单文件最大 2 GB（免下载转存模式）</i>',
                         { reply_markup: buildMainMenuKeyboard(), disable_web_page_preview: true },
                         proxyUrl,
                     );
@@ -393,7 +403,7 @@ export async function onRequest(context) {
 
                 if (data.startsWith('upload_')) {
                     const pendingKey = data.slice(7);
-                    await answerCallback(botToken, cb.id, '正在上传…', proxyUrl);
+                    await answerCallback(botToken, cb.id, '正在转存到图床…', proxyUrl);
 
                     const pending = await getPending(db, pendingKey);
                     if (!pending) {
@@ -405,14 +415,75 @@ export async function onRequest(context) {
                     }
 
                     await editMessage(botToken, chatId, msgId,
-                        `⏳ 正在下载 <b>${escapeHtml(pending.file_name)}</b> 并上传到图床，请稍候…`,
+                        `⏳ 正在转存 <b>${escapeHtml(pending.file_name)}</b> 到频道，请稍候…`,
                         {}, proxyUrl,
                     );
 
                     try {
-                        const { arrayBuffer } = await downloadTgFile(botToken, pending.file_id, proxyUrl);
-                        const link = await doUpload(context, pending, arrayBuffer, originUrl);
+                        const uploadConfig = await fetchUploadConfig(env, context);
+                        const tgChannels = uploadConfig.telegram?.channels || [];
+                        const tgChannel = tgChannels[0];
+                        if (!tgChannel) {
+                            throw new Error('未配置 Telegram 存储渠道，请在后台系统设置中启用并配置');
+                        }
+
+                        const targetChatId = tgChannel.chatId;
+                        const targetBotToken = tgChannel.botToken || botToken;
+                        const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || '';
+
+                        // 直接转存（免下载）
+                        const copyRes = await copyMessage(targetBotToken, targetChatId, pending.chat_id, pending.message_id, {}, targetProxyUrl);
+                        if (!copyRes.ok) {
+                            throw new Error(`Telegram API copyMessage 失败: ${copyRes.description}`);
+                        }
+
+                        // 构建唯一文件ID
+                        const fakeUrl = new URL(context.request.url);
+                        fakeUrl.searchParams.set('uploadNameType', 'default');
+                        fakeUrl.searchParams.set('uploadFolder', '');
+                        const fakeContext = {
+                            ...context,
+                            url: fakeUrl
+                        };
+
+                        const fullId = await buildUniqueFileId(fakeContext, pending.file_name, pending.mime_type);
+
+                        // 构造 metadata，并打上大文件和来源标签以及消息ID和频道ID
+                        const isLarge = pending.file_size > 20 * 1024 * 1024;
+                        const metadata = {
+                            FileName: pending.file_name,
+                            FileType: pending.mime_type,
+                            FileSize: (pending.file_size / 1024 / 1024).toFixed(2),
+                            FileSizeBytes: pending.file_size,
+                            UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
+                            UploadAddress: 'Telegram Bot',
+                            ListType: "None",
+                            TimeStamp: Date.now(),
+                            Label: "None",
+                            Directory: "",
+                            Tags: isLarge ? ["tgbot_large"] : [],
+                            IsLargeFile: isLarge,
+                            Channel: "TelegramNew",
+                            ChannelName: tgChannel.name,
+                            TgFileId: pending.file_id,
+                            TgMsgId: copyRes.result.message_id,
+                            TgChatId: targetChatId,
+                        };
+
+                        // 写入 KV 数据库
+                        await db.put(fullId, "", { metadata });
+
+                        // 触发结束上传的后台任务（清除缓存、增加索引）
+                        context.waitUntil(endUpload(fakeContext, fullId, metadata));
+
+                        // 获取公开链接配置
+                        const pageConfig = await fetchPageConfig(env);
+                        const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
+                        const urlPrefix = urlPrefixConfig?.value || '';
+                        const link = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : `${originUrl}/file/${fullId}`;
+
                         await deletePending(db, pendingKey);
+
                         await editMessage(botToken, chatId, msgId,
                             `✅ <b>上传成功！</b>\n\n` +
                             `📄 文件名：<code>${escapeHtml(pending.file_name)}</code>\n` +
@@ -423,10 +494,10 @@ export async function onRequest(context) {
                             proxyUrl,
                         );
                     } catch (err) {
-                        console.error('[TgBot] Upload failed:', err);
+                        console.error('[TgBot] Copy & Register failed:', err);
                         await editMessage(botToken, chatId, msgId,
                             `❌ <b>上传失败</b>\n\n<code>${escapeHtml(String(err.message || err))}</code>\n\n` +
-                            `请检查图床渠道配置后重试，或直接通过网页上传。`,
+                            `请检查 Telegram 渠道配置后重试。`,
                             {}, proxyUrl,
                         );
                     }
@@ -483,7 +554,7 @@ export async function onRequest(context) {
                     '/start — 打开主菜单\n' +
                     '/list  — 最近上传的文件\n' +
                     '/help  — 显示此帮助\n\n' +
-                    '<i>⚠️ 单文件最大 20 MB（Telegram Bot API 限制）</i>',
+                    '<i>⚠️ 单文件最大 2 GB（免下载转存模式）</i>',
                     { reply_markup: buildMainMenuKeyboard(), disable_web_page_preview: true },
                     proxyUrl,
                 );
@@ -503,13 +574,13 @@ export async function onRequest(context) {
             // 收到文件 → 弹出确认菜单
             const fileInfo = extractFileFromMessage(message);
             if (fileInfo) {
-                const MAX_SIZE = 20 * 1024 * 1024; // 20 MB
+                const MAX_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
                 if (fileInfo.file_size > MAX_SIZE) {
                     await sendMessage(botToken, chatId,
                         `⚠️ <b>文件过大</b>\n\n` +
                         `<code>${escapeHtml(fileInfo.file_name)}</code>\n` +
-                        `大小 ${formatSize(fileInfo.file_size)} 超过 20 MB 限制。\n\n` +
-                        `请直接通过图床网页上传大文件。`,
+                        `大小 ${formatSize(fileInfo.file_size)} 超过 2 GB 限制。\n\n` +
+                        `请直接拖拽小于 2 GB 的文件。`,
                         {}, proxyUrl,
                     );
                     return;
@@ -522,6 +593,7 @@ export async function onRequest(context) {
                     mime_type: fileInfo.mime_type,
                     file_size: fileInfo.file_size,
                     chat_id: chatId,
+                    message_id: message.message_id,
                 });
 
                 await sendMessage(botToken, chatId,

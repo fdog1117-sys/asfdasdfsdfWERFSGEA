@@ -22,7 +22,7 @@
 import { getDatabase } from '../../utils/databaseAdapter.js';
 import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig } from '../../utils/sysConfig.js';
 import { buildUniqueFileId, endUpload, resolveFileExt } from '../../upload/uploadTools.js';
-import { TelegramAPI } from '../../utils/storage/telegramAPI.js';
+import { uploadLargeFileToTelegram } from '../../upload/chunkUpload.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram API 工具函数
@@ -88,116 +88,7 @@ async function downloadTgFile(botToken, fileId, proxyUrl = '') {
     return { arrayBuffer: await fileRes.arrayBuffer(), filePath };
 }
 
-/**
- * 下载大文件并自动切片上传到 Telegram 频道
- */
-async function downloadAndSliceTelegramFile(botToken, fileId, proxyUrl, targetBotToken, targetChatId, targetProxyUrl, fileName, fileSize) {
-    const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB
-    const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-    
-    // 为了防止执行超时，限制最大分片数（例如最多 100 个分片，约 1.6GB）
-    if (totalChunks > 100) {
-        throw new Error('文件过大，超出图床机器人转存大小限制（最大 1.6 GB）');
-    }
-    
-    const apiBase = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
-    const infoRes = await fetch(`${apiBase}/bot${botToken}/getFile?file_id=${fileId}`);
-    const info = await infoRes.json();
-    if (!info.ok) {
-        if (info.description && info.description.includes('file is too big')) {
-            throw new Error('下载文件失败：文件大小超过 20MB 限制 (Telegram Bot 官方限制)。要支持 20MB 以上大文件，请配置本地 Telegram Bot API 服务器代理 (TG_PROXY_URL)。');
-        }
-        throw new Error(`getFile 失败: ${info.description}`);
-    }
-    
-    const filePath = info.result.file_path;
-    const fileRes = await fetch(`${apiBase}/file/bot${botToken}/${filePath}`);
-    if (!fileRes.ok) throw new Error(`下载文件失败: HTTP ${fileRes.status}`);
-    
-    const reader = fileRes.body.getReader();
-    const chunks = [];
-    const tgAPI = new TelegramAPI(targetBotToken, targetProxyUrl);
-    
-    let buffer = new Uint8Array(0);
-    let chunkIndex = 0;
-    
-    try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (value) {
-                const newBuffer = new Uint8Array(buffer.length + value.length);
-                newBuffer.set(buffer);
-                newBuffer.set(value, buffer.length);
-                buffer = newBuffer;
-            }
-            
-            while (buffer.length >= CHUNK_SIZE) {
-                const chunkData = buffer.slice(0, CHUNK_SIZE);
-                buffer = buffer.slice(CHUNK_SIZE);
-                
-                const chunkFileName = `${fileName}.part${chunkIndex.toString().padStart(3, '0')}`;
-                const chunkBlob = new Blob([chunkData], { type: 'application/octet-stream' });
-                
-                const caption = `Part ${chunkIndex + 1}/${totalChunks}`;
-                const uploadRes = await tgAPI.sendFile(chunkBlob, targetChatId, 'sendDocument', 'document', caption, chunkFileName);
-                if (!uploadRes.ok) {
-                    throw new Error(`分片 ${chunkIndex + 1} 上传失败: ${uploadRes.description || '未知错误'}`);
-                }
-                
-                const fileInfo = tgAPI.getFileInfo(uploadRes);
-                if (!fileInfo) {
-                    throw new Error(`解析分片 ${chunkIndex + 1} 响应失败`);
-                }
-                
-                chunks.push({
-                    index: chunkIndex,
-                    fileId: fileInfo.file_id,
-                    size: fileInfo.file_size,
-                    fileName: chunkFileName
-                });
-                
-                chunkIndex++;
-            }
-            
-            if (done) {
-                if (buffer.length > 0) {
-                    const chunkFileName = `${fileName}.part${chunkIndex.toString().padStart(3, '0')}`;
-                    const chunkBlob = new Blob([buffer], { type: 'application/octet-stream' });
-                    
-                    const caption = `Part ${chunkIndex + 1}/${totalChunks}`;
-                    const uploadRes = await tgAPI.sendFile(chunkBlob, targetChatId, 'sendDocument', 'document', caption, chunkFileName);
-                    if (!uploadRes.ok) {
-                        throw new Error(`最后分片 ${chunkIndex + 1} 上传失败: ${uploadRes.description || '未知错误'}`);
-                    }
-                    
-                    const fileInfo = tgAPI.getFileInfo(uploadRes);
-                    if (!fileInfo) {
-                        throw new Error(`解析最后分片 ${chunkIndex + 1} 响应失败`);
-                    }
-                    
-                    chunks.push({
-                        index: chunkIndex,
-                        fileId: fileInfo.file_id,
-                        size: fileInfo.file_size,
-                        fileName: chunkFileName
-                    });
-                }
-                break;
-            }
-        }
-    } catch (err) {
-        try {
-            await reader.cancel();
-        } catch (_) {}
-        throw err;
-    } finally {
-        try {
-            reader.releaseLock();
-        } catch (_) {}
-    }
-    
-    return chunks;
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 内联键盘构建
@@ -574,7 +465,12 @@ export async function onRequest(context) {
 
                         const isLarge = pending.file_size > 20 * 1024 * 1024;
                         let metadata;
-                        let dbValue = "";
+
+                        // 获取公开链接配置
+                        const pageConfig = await fetchPageConfig(env);
+                        const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
+                        const urlPrefix = urlPrefixConfig?.value || '';
+                        const link = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : `${originUrl}/file/${fullId}`;
 
                         if (isLarge) {
                             await editMessage(botToken, chatId, msgId,
@@ -582,18 +478,8 @@ export async function onRequest(context) {
                                 {}, proxyUrl
                             );
 
-                            const chunks = await downloadAndSliceTelegramFile(
-                                botToken,
-                                pending.file_id,
-                                proxyUrl,
-                                targetBotToken,
-                                targetChatId,
-                                targetProxyUrl,
-                                pending.file_name,
-                                pending.file_size
-                            );
-
-                            dbValue = JSON.stringify(chunks);
+                            const { arrayBuffer } = await downloadTgFile(botToken, pending.file_id, proxyUrl);
+                            const fileBlob = new Blob([arrayBuffer], { type: pending.mime_type });
 
                             metadata = {
                                 FileName: pending.file_name,
@@ -608,11 +494,25 @@ export async function onRequest(context) {
                                 Directory: "",
                                 Tags: ["tgbot_large"],
                                 IsLargeFile: true,
-                                IsChunked: true,
-                                TotalChunks: chunks.length,
-                                Channel: "TelegramNew",
-                                ChannelName: tgChannel.name,
                             };
+
+                            const uploadRes = await uploadLargeFileToTelegram(
+                                fakeContext,
+                                fileBlob,
+                                fullId,
+                                metadata,
+                                pending.file_name,
+                                pending.mime_type,
+                                link,
+                                targetBotToken,
+                                targetChatId,
+                                tgChannel
+                            );
+
+                            if (uploadRes.status !== 200) {
+                                const errorText = await uploadRes.text();
+                                throw new Error(`切片转存失败: ${errorText}`);
+                            }
                         } else {
                             // 直接转存（免下载）
                             const copyRes = await copyMessage(targetBotToken, targetChatId, pending.chat_id, pending.message_id, {}, targetProxyUrl);
@@ -639,19 +539,13 @@ export async function onRequest(context) {
                                 TgMsgId: copyRes.result.message_id,
                                 TgChatId: targetChatId,
                             };
+
+                            // 写入 KV 数据库
+                            await db.put(fullId, "", { metadata });
+
+                            // 触发结束上传的后台任务（清除缓存、增加索引）
+                            context.waitUntil(endUpload(fakeContext, fullId, metadata));
                         }
-
-                        // 写入 KV 数据库
-                        await db.put(fullId, dbValue, { metadata });
-
-                        // 触发结束上传的后台任务（清除缓存、增加索引）
-                        context.waitUntil(endUpload(fakeContext, fullId, metadata));
-
-                        // 获取公开链接配置
-                        const pageConfig = await fetchPageConfig(env);
-                        const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
-                        const urlPrefix = urlPrefixConfig?.value || '';
-                        const link = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : `${originUrl}/file/${fullId}`;
 
                         await deletePending(db, pendingKey);
 
@@ -790,7 +684,12 @@ export async function onRequest(context) {
 
                     const isLarge = fileInfo.file_size > 20 * 1024 * 1024;
                     let metadata;
-                    let dbValue = "";
+
+                    // 获取公开链接配置
+                    const pageConfig = await fetchPageConfig(env);
+                    const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
+                    const urlPrefix = urlPrefixConfig?.value || '';
+                    const link = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : `${originUrl}/file/${fullId}`;
 
                     if (isLarge) {
                         if (msgId) {
@@ -800,18 +699,8 @@ export async function onRequest(context) {
                             );
                         }
 
-                        const chunks = await downloadAndSliceTelegramFile(
-                            botToken,
-                            fileInfo.file_id,
-                            proxyUrl,
-                            targetBotToken,
-                            targetChatId,
-                            targetProxyUrl,
-                            fileInfo.file_name,
-                            fileInfo.file_size
-                        );
-
-                        dbValue = JSON.stringify(chunks);
+                        const { arrayBuffer } = await downloadTgFile(botToken, fileInfo.file_id, proxyUrl);
+                        const fileBlob = new Blob([arrayBuffer], { type: fileInfo.mime_type });
 
                         metadata = {
                             FileName: fileInfo.file_name,
@@ -826,11 +715,25 @@ export async function onRequest(context) {
                             Directory: "",
                             Tags: ["tgbot_large"],
                             IsLargeFile: true,
-                            IsChunked: true,
-                            TotalChunks: chunks.length,
-                            Channel: "TelegramNew",
-                            ChannelName: tgChannel.name,
                         };
+
+                        const uploadRes = await uploadLargeFileToTelegram(
+                            fakeContext,
+                            fileBlob,
+                            fullId,
+                            metadata,
+                            fileInfo.file_name,
+                            fileInfo.mime_type,
+                            link,
+                            targetBotToken,
+                            targetChatId,
+                            tgChannel
+                        );
+
+                        if (uploadRes.status !== 200) {
+                            const errorText = await uploadRes.text();
+                            throw new Error(`切片转存失败: ${errorText}`);
+                        }
                     } else {
                         // 直接转存（免下载）
                         const copyRes = await copyMessage(targetBotToken, targetChatId, chatId, message.message_id, {}, targetProxyUrl);
@@ -857,19 +760,15 @@ export async function onRequest(context) {
                             TgMsgId: copyRes.result.message_id,
                             TgChatId: targetChatId,
                         };
+
+                        // 写入 KV 数据库
+                        await db.put(fullId, "", { metadata });
+
+                        // 触发结束上传的后台任务（清除缓存、增加索引）
+                        context.waitUntil(endUpload(fakeContext, fullId, metadata));
                     }
 
-                    // 写入 KV 数据库
-                    await db.put(fullId, dbValue, { metadata });
 
-                    // 触发结束上传的后台任务（清除缓存、增加索引）
-                    context.waitUntil(endUpload(fakeContext, fullId, metadata));
-
-                    // 获取公开链接配置
-                    const pageConfig = await fetchPageConfig(env);
-                    const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
-                    const urlPrefix = urlPrefixConfig?.value || '';
-                    const link = urlPrefix ? `${urlPrefix.replace(/\/+$/, '')}/${fullId}` : `${originUrl}/file/${fullId}`;
 
                     const successText = `✅ <b>上传成功！</b>\n\n` +
                         `📄 文件名：<code>${escapeHtml(fileInfo.file_name)}</code>\n` +

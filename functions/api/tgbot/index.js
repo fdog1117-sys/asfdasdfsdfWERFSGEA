@@ -439,10 +439,12 @@ export async function onRequest(context) {
                 userId = update.chosen_inline_result.from?.id;
             }
 
-            if (!userId || (userId !== 8506720558 && String(userId) !== '8506720558')) {
-                // 如果不是8506720558这个id和机器人对话都不回复
-                return;
+            // 允许的用户 ID（从环境变量 TG_ALLOWED_USER_ID 读取，不配置则允许所有人）
+            const allowedUserId = env.TG_ALLOWED_USER_ID ? String(env.TG_ALLOWED_USER_ID).trim() : '';
+            if (allowedUserId && (!userId || String(userId) !== allowedUserId)) {
+                return; // 不是允许的用户，静默忽略
             }
+
 
             // ── CallbackQuery ──────────────────────────────────────────────
             if (update.callback_query) {

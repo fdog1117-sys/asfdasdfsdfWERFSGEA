@@ -450,7 +450,7 @@ export async function onRequest(context) {
             const tgChannels = uploadConfig.telegram?.channels || [];
             if (tgChannels.length > 0) {
                 botToken = tgChannels[0].botToken || '';
-                proxyUrl = tgChannels[0].proxyUrl || '';
+                proxyUrl = tgChannels[0].proxyUrl || env.TG_PROXY_URL || '';
             }
         } catch (e) {
             console.error('[TgBot] Failed to fetch upload config:', e);
@@ -559,7 +559,7 @@ export async function onRequest(context) {
 
                         const targetChatId = tgChannel.chatId;
                         const targetBotToken = tgChannel.botToken || botToken;
-                        const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || '';
+                        const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || env.TG_PROXY_URL || '';
 
                         // 构建唯一文件ID
                         const fakeUrl = new URL(context.request.url);
@@ -775,7 +775,7 @@ export async function onRequest(context) {
 
                     const targetChatId = tgChannel.chatId;
                     const targetBotToken = tgChannel.botToken || botToken;
-                    const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || '';
+                    const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || env.TG_PROXY_URL || '';
 
                     // 构建唯一文件ID
                     const fakeUrl = new URL(context.request.url);

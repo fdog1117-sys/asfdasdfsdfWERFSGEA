@@ -139,7 +139,7 @@ export async function onRequest(context) {  // Contents of context object
         // 获取TG图片真实地址（支持代理域名）
         const tgCredentials = await resolveTelegramCredentials(db, env, imgRecord.metadata);
         const TgBotToken = tgCredentials.botToken;
-        const TgProxyUrl = tgCredentials.proxyUrl || '';
+        const TgProxyUrl = tgCredentials.proxyUrl || env.TG_PROXY_URL || '';
         const tgApi = new TelegramAPI(TgBotToken, TgProxyUrl);
         const filePath = await tgApi.getFilePath(TgFileID);
         if (filePath === null) {
@@ -216,7 +216,7 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
     const db = getDatabase(env);
     const tgCredentials = await resolveTelegramCredentials(db, env, metadata);
     const TgBotToken = tgCredentials.botToken;
-    const TgProxyUrl = tgCredentials.proxyUrl || '';
+    const TgProxyUrl = tgCredentials.proxyUrl || env.TG_PROXY_URL || '';
 
     // 从KV的value中读取分片信息
     let chunks = [];

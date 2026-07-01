@@ -22,7 +22,7 @@
 import { getDatabase } from '../../utils/databaseAdapter.js';
 import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig } from '../../utils/sysConfig.js';
 import { buildUniqueFileId, endUpload, resolveFileExt } from '../../upload/uploadTools.js';
-import { uploadLargeFileToTelegram } from '../../upload/chunkUpload.js';
+import { TelegramAPI } from '../../utils/storage/telegramAPI.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram API 工具函数
@@ -86,6 +86,63 @@ async function downloadTgFile(botToken, fileId, proxyUrl = '') {
     const fileRes = await fetch(`${apiBase}/file/bot${botToken}/${filePath}`);
     if (!fileRes.ok) throw new Error(`下载文件失败: HTTP ${fileRes.status}`);
     return { arrayBuffer: await fileRes.arrayBuffer(), filePath };
+}
+/**
+ * 下载大文件并自动切片上传到 Telegram 频道
+ * 注意：内嵌实现，不依赖 chunkUpload.js，避免拦破 @aws-sdk 导入导致 Worker 崩溃
+ */
+async function downloadAndSliceTelegramFile(botToken, fileId, proxyUrl, targetBotToken, targetChatId, targetProxyUrl, fileName, fileSize) {
+    const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB
+    const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+
+    if (totalChunks > 100) {
+        throw new Error('文件过大，超出转存限制（最大 1.6 GB）');
+    }
+
+    const apiBase = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
+    const infoRes = await fetch(`${apiBase}/bot${botToken}/getFile?file_id=${fileId}`);
+    const info = await infoRes.json();
+    if (!info.ok) {
+        if (info.description && info.description.includes('file is too big')) {
+            throw new Error('下载失败：文件大于 20MB。请在 TG_PROXY_URL 配置本地 Telegram Bot API 代理。');
+        }
+        throw new Error(`getFile 失败: ${info.description}`);
+    }
+
+    const filePath = info.result.file_path;
+    const fileRes = await fetch(`${apiBase}/file/bot${botToken}/${filePath}`);
+    if (!fileRes.ok) throw new Error(`下载文件失败: HTTP ${fileRes.status}`);
+
+    const arrayBuffer = await fileRes.arrayBuffer();
+    const fileData = new Uint8Array(arrayBuffer);
+
+    const chunks = [];
+    const tgAPI = new TelegramAPI(targetBotToken, targetProxyUrl);
+
+    for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, fileData.length);
+        const chunkData = fileData.slice(start, end);
+        const chunkFileName = `${fileName}.part${i.toString().padStart(3, '0')}`;
+        const chunkBlob = new Blob([chunkData], { type: 'application/octet-stream' });
+        const caption = `Part ${i + 1}/${totalChunks}`;
+
+        const uploadRes = await tgAPI.sendFile(chunkBlob, targetChatId, 'sendDocument', 'document', caption, chunkFileName);
+        if (!uploadRes.ok) {
+            throw new Error(`分片 ${i + 1} 上传失败: ${uploadRes.description || '未知错误'}`);
+        }
+        const fileInfo = tgAPI.getFileInfo(uploadRes);
+        if (!fileInfo) throw new Error(`解析分片 ${i + 1} 响应失败`);
+
+        chunks.push({
+            index: i,
+            fileId: fileInfo.file_id,
+            size: fileInfo.file_size,
+            fileName: chunkFileName
+        });
+    }
+
+    return chunks;
 }
 
 
@@ -482,8 +539,7 @@ export async function onRequest(context) {
                                 {}, proxyUrl
                             );
 
-                            const { arrayBuffer } = await downloadTgFile(botToken, pending.file_id, proxyUrl);
-                            const fileBlob = new Blob([arrayBuffer], { type: pending.mime_type });
+
 
                             metadata = {
                                 FileName: pending.file_name,
@@ -500,23 +556,24 @@ export async function onRequest(context) {
                                 IsLargeFile: true,
                             };
 
-                            const uploadRes = await uploadLargeFileToTelegram(
-                                fakeContext,
-                                fileBlob,
-                                fullId,
-                                metadata,
-                                pending.file_name,
-                                pending.mime_type,
-                                link,
+                            const chunks = await downloadAndSliceTelegramFile(
+                                botToken,
+                                pending.file_id,
+                                proxyUrl,
                                 targetBotToken,
                                 targetChatId,
-                                tgChannel
+                                targetProxyUrl,
+                                pending.file_name,
+                                pending.file_size
                             );
 
-                            if (uploadRes.status !== 200) {
-                                const errorText = await uploadRes.text();
-                                throw new Error(`切片转存失败: ${errorText}`);
-                            }
+                            metadata.IsChunked = true;
+                            metadata.TotalChunks = chunks.length;
+                            metadata.Channel = "TelegramNew";
+                            metadata.ChannelName = tgChannel.name;
+
+                            await db.put(fullId, JSON.stringify(chunks), { metadata });
+                            context.waitUntil(endUpload(fakeContext, fullId, metadata));
                         } else {
                             // 直接转存（免下载）
                             const copyRes = await copyMessage(targetBotToken, targetChatId, pending.chat_id, pending.message_id, {}, targetProxyUrl);
@@ -703,8 +760,7 @@ export async function onRequest(context) {
                             );
                         }
 
-                        const { arrayBuffer } = await downloadTgFile(botToken, fileInfo.file_id, proxyUrl);
-                        const fileBlob = new Blob([arrayBuffer], { type: fileInfo.mime_type });
+
 
                         metadata = {
                             FileName: fileInfo.file_name,
@@ -721,23 +777,24 @@ export async function onRequest(context) {
                             IsLargeFile: true,
                         };
 
-                        const uploadRes = await uploadLargeFileToTelegram(
-                            fakeContext,
-                            fileBlob,
-                            fullId,
-                            metadata,
-                            fileInfo.file_name,
-                            fileInfo.mime_type,
-                            link,
+                        const chunks = await downloadAndSliceTelegramFile(
+                            botToken,
+                            fileInfo.file_id,
+                            proxyUrl,
                             targetBotToken,
                             targetChatId,
-                            tgChannel
+                            targetProxyUrl,
+                            fileInfo.file_name,
+                            fileInfo.file_size
                         );
 
-                        if (uploadRes.status !== 200) {
-                            const errorText = await uploadRes.text();
-                            throw new Error(`切片转存失败: ${errorText}`);
-                        }
+                        metadata.IsChunked = true;
+                        metadata.TotalChunks = chunks.length;
+                        metadata.Channel = "TelegramNew";
+                        metadata.ChannelName = tgChannel.name;
+
+                        await db.put(fullId, JSON.stringify(chunks), { metadata });
+                        context.waitUntil(endUpload(fakeContext, fullId, metadata));
                     } else {
                         // 直接转存（免下载）
                         const copyRes = await copyMessage(targetBotToken, targetChatId, chatId, message.message_id, {}, targetProxyUrl);

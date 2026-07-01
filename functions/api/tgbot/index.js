@@ -28,8 +28,19 @@ import { TelegramAPI } from '../../utils/storage/telegramAPI.js';
 // Telegram API 工具函数
 // ─────────────────────────────────────────────────────────────────────────────
 
+function getApiBase(proxyUrl) {
+    if (proxyUrl) {
+        let base = proxyUrl.trim();
+        if (!/^https?:\/\//i.test(base)) {
+            base = `https://${base}`;
+        }
+        return base.replace(/\/+$/, '');
+    }
+    return 'https://api.telegram.org';
+}
+
 async function tgCall(botToken, method, body = {}, proxyUrl = '') {
-    const apiBase = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
+    const apiBase = getApiBase(proxyUrl);
     const res = await fetch(`${apiBase}/bot${botToken}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -78,7 +89,7 @@ async function copyMessage(botToken, chatId, fromChatId, messageId, options = {}
  * 注意：TG Bot API 最大可下载 20 MB
  */
 async function downloadTgFile(botToken, fileId, proxyUrl = '') {
-    const apiBase = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
+    const apiBase = getApiBase(proxyUrl);
     const infoRes = await fetch(`${apiBase}/bot${botToken}/getFile?file_id=${fileId}`);
     const info = await infoRes.json();
     if (!info.ok) throw new Error(`getFile 失败: ${info.description}`);
@@ -99,7 +110,7 @@ async function downloadAndSliceTelegramFile(botToken, fileId, proxyUrl, targetBo
         throw new Error('文件过大，超出转存限制（最大 1.6 GB）');
     }
 
-    const apiBase = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
+    const apiBase = getApiBase(proxyUrl);
     const infoRes = await fetch(`${apiBase}/bot${botToken}/getFile?file_id=${fileId}`);
     const info = await infoRes.json();
     if (!info.ok) {

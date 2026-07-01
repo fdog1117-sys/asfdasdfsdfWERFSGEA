@@ -22,6 +22,7 @@
 import { getDatabase } from '../../utils/databaseAdapter.js';
 import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig } from '../../utils/sysConfig.js';
 import { buildUniqueFileId, endUpload, resolveFileExt } from '../../upload/uploadTools.js';
+import { TelegramAPI } from '../../utils/storage/telegramAPI.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram API 工具函数
@@ -85,6 +86,117 @@ async function downloadTgFile(botToken, fileId, proxyUrl = '') {
     const fileRes = await fetch(`${apiBase}/file/bot${botToken}/${filePath}`);
     if (!fileRes.ok) throw new Error(`下载文件失败: HTTP ${fileRes.status}`);
     return { arrayBuffer: await fileRes.arrayBuffer(), filePath };
+}
+
+/**
+ * 下载大文件并自动切片上传到 Telegram 频道
+ */
+async function downloadAndSliceTelegramFile(botToken, fileId, proxyUrl, targetBotToken, targetChatId, targetProxyUrl, fileName, fileSize) {
+    const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB
+    const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+    
+    // 为了防止执行超时，限制最大分片数（例如最多 100 个分片，约 1.6GB）
+    if (totalChunks > 100) {
+        throw new Error('文件过大，超出图床机器人转存大小限制（最大 1.6 GB）');
+    }
+    
+    const apiBase = proxyUrl ? `https://${proxyUrl}` : 'https://api.telegram.org';
+    const infoRes = await fetch(`${apiBase}/bot${botToken}/getFile?file_id=${fileId}`);
+    const info = await infoRes.json();
+    if (!info.ok) {
+        if (info.description && info.description.includes('file is too big')) {
+            throw new Error('下载文件失败：文件大小超过 20MB 限制 (Telegram Bot 官方限制)。要支持 20MB 以上大文件，请配置本地 Telegram Bot API 服务器代理 (TG_PROXY_URL)。');
+        }
+        throw new Error(`getFile 失败: ${info.description}`);
+    }
+    
+    const filePath = info.result.file_path;
+    const fileRes = await fetch(`${apiBase}/file/bot${botToken}/${filePath}`);
+    if (!fileRes.ok) throw new Error(`下载文件失败: HTTP ${fileRes.status}`);
+    
+    const reader = fileRes.body.getReader();
+    const chunks = [];
+    const tgAPI = new TelegramAPI(targetBotToken, targetProxyUrl);
+    
+    let buffer = new Uint8Array(0);
+    let chunkIndex = 0;
+    
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (value) {
+                const newBuffer = new Uint8Array(buffer.length + value.length);
+                newBuffer.set(buffer);
+                newBuffer.set(value, buffer.length);
+                buffer = newBuffer;
+            }
+            
+            while (buffer.length >= CHUNK_SIZE) {
+                const chunkData = buffer.slice(0, CHUNK_SIZE);
+                buffer = buffer.slice(CHUNK_SIZE);
+                
+                const chunkFileName = `${fileName}.part${chunkIndex.toString().padStart(3, '0')}`;
+                const chunkBlob = new Blob([chunkData], { type: 'application/octet-stream' });
+                
+                const caption = `Part ${chunkIndex + 1}/${totalChunks}`;
+                const uploadRes = await tgAPI.sendFile(chunkBlob, targetChatId, 'sendDocument', 'document', caption, chunkFileName);
+                if (!uploadRes.ok) {
+                    throw new Error(`分片 ${chunkIndex + 1} 上传失败: ${uploadRes.description || '未知错误'}`);
+                }
+                
+                const fileInfo = tgAPI.getFileInfo(uploadRes);
+                if (!fileInfo) {
+                    throw new Error(`解析分片 ${chunkIndex + 1} 响应失败`);
+                }
+                
+                chunks.push({
+                    index: chunkIndex,
+                    fileId: fileInfo.file_id,
+                    size: fileInfo.file_size,
+                    fileName: chunkFileName
+                });
+                
+                chunkIndex++;
+            }
+            
+            if (done) {
+                if (buffer.length > 0) {
+                    const chunkFileName = `${fileName}.part${chunkIndex.toString().padStart(3, '0')}`;
+                    const chunkBlob = new Blob([buffer], { type: 'application/octet-stream' });
+                    
+                    const caption = `Part ${chunkIndex + 1}/${totalChunks}`;
+                    const uploadRes = await tgAPI.sendFile(chunkBlob, targetChatId, 'sendDocument', 'document', caption, chunkFileName);
+                    if (!uploadRes.ok) {
+                        throw new Error(`最后分片 ${chunkIndex + 1} 上传失败: ${uploadRes.description || '未知错误'}`);
+                    }
+                    
+                    const fileInfo = tgAPI.getFileInfo(uploadRes);
+                    if (!fileInfo) {
+                        throw new Error(`解析最后分片 ${chunkIndex + 1} 响应失败`);
+                    }
+                    
+                    chunks.push({
+                        index: chunkIndex,
+                        fileId: fileInfo.file_id,
+                        size: fileInfo.file_size,
+                        fileName: chunkFileName
+                    });
+                }
+                break;
+            }
+        }
+    } catch (err) {
+        try {
+            await reader.cancel();
+        } catch (_) {}
+        throw err;
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch (_) {}
+    }
+    
+    return chunks;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -449,12 +561,6 @@ export async function onRequest(context) {
                         const targetBotToken = tgChannel.botToken || botToken;
                         const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || '';
 
-                        // 直接转存（免下载）
-                        const copyRes = await copyMessage(targetBotToken, targetChatId, pending.chat_id, pending.message_id, {}, targetProxyUrl);
-                        if (!copyRes.ok) {
-                            throw new Error(`Telegram API copyMessage 失败: ${copyRes.description}`);
-                        }
-
                         // 构建唯一文件ID
                         const fakeUrl = new URL(context.request.url);
                         fakeUrl.searchParams.set('uploadNameType', 'default');
@@ -466,30 +572,77 @@ export async function onRequest(context) {
 
                         const fullId = await buildUniqueFileId(fakeContext, pending.file_name, pending.mime_type);
 
-                        // 构造 metadata，并打上大文件和来源标签以及消息ID和频道ID
                         const isLarge = pending.file_size > 20 * 1024 * 1024;
-                        const metadata = {
-                            FileName: pending.file_name,
-                            FileType: pending.mime_type,
-                            FileSize: (pending.file_size / 1024 / 1024).toFixed(2),
-                            FileSizeBytes: pending.file_size,
-                            UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
-                            UploadAddress: 'Telegram Bot',
-                            ListType: "None",
-                            TimeStamp: Date.now(),
-                            Label: "None",
-                            Directory: "",
-                            Tags: isLarge ? ["tgbot_large"] : [],
-                            IsLargeFile: isLarge,
-                            Channel: "TelegramNew",
-                            ChannelName: tgChannel.name,
-                            TgFileId: pending.file_id,
-                            TgMsgId: copyRes.result.message_id,
-                            TgChatId: targetChatId,
-                        };
+                        let metadata;
+                        let dbValue = "";
+
+                        if (isLarge) {
+                            await editMessage(botToken, chatId, msgId,
+                                `⏳ 文件大于 20MB，正在下载并切片转存 <b>${escapeHtml(pending.file_name)}</b> 到频道，请稍候…`,
+                                {}, proxyUrl
+                            );
+
+                            const chunks = await downloadAndSliceTelegramFile(
+                                botToken,
+                                pending.file_id,
+                                proxyUrl,
+                                targetBotToken,
+                                targetChatId,
+                                targetProxyUrl,
+                                pending.file_name,
+                                pending.file_size
+                            );
+
+                            dbValue = JSON.stringify(chunks);
+
+                            metadata = {
+                                FileName: pending.file_name,
+                                FileType: pending.mime_type,
+                                FileSize: (pending.file_size / 1024 / 1024).toFixed(2),
+                                FileSizeBytes: pending.file_size,
+                                UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
+                                UploadAddress: 'Telegram Bot',
+                                ListType: "None",
+                                TimeStamp: Date.now(),
+                                Label: "None",
+                                Directory: "",
+                                Tags: ["tgbot_large"],
+                                IsLargeFile: true,
+                                IsChunked: true,
+                                TotalChunks: chunks.length,
+                                Channel: "TelegramNew",
+                                ChannelName: tgChannel.name,
+                            };
+                        } else {
+                            // 直接转存（免下载）
+                            const copyRes = await copyMessage(targetBotToken, targetChatId, pending.chat_id, pending.message_id, {}, targetProxyUrl);
+                            if (!copyRes.ok) {
+                                throw new Error(`Telegram API copyMessage 失败: ${copyRes.description}`);
+                            }
+
+                            metadata = {
+                                FileName: pending.file_name,
+                                FileType: pending.mime_type,
+                                FileSize: (pending.file_size / 1024 / 1024).toFixed(2),
+                                FileSizeBytes: pending.file_size,
+                                UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
+                                UploadAddress: 'Telegram Bot',
+                                ListType: "None",
+                                TimeStamp: Date.now(),
+                                Label: "None",
+                                Directory: "",
+                                Tags: [],
+                                IsLargeFile: false,
+                                Channel: "TelegramNew",
+                                ChannelName: tgChannel.name,
+                                TgFileId: pending.file_id,
+                                TgMsgId: copyRes.result.message_id,
+                                TgChatId: targetChatId,
+                            };
+                        }
 
                         // 写入 KV 数据库
-                        await db.put(fullId, "", { metadata });
+                        await db.put(fullId, dbValue, { metadata });
 
                         // 触发结束上传的后台任务（清除缓存、增加索引）
                         context.waitUntil(endUpload(fakeContext, fullId, metadata));
@@ -624,12 +777,6 @@ export async function onRequest(context) {
                     const targetBotToken = tgChannel.botToken || botToken;
                     const targetProxyUrl = tgChannel.proxyUrl || proxyUrl || '';
 
-                    // 直接转存（免下载）
-                    const copyRes = await copyMessage(targetBotToken, targetChatId, chatId, message.message_id, {}, targetProxyUrl);
-                    if (!copyRes.ok) {
-                        throw new Error(`Telegram API copyMessage 失败: ${copyRes.description}`);
-                    }
-
                     // 构建唯一文件ID
                     const fakeUrl = new URL(context.request.url);
                     fakeUrl.searchParams.set('uploadNameType', 'default');
@@ -641,30 +788,79 @@ export async function onRequest(context) {
 
                     const fullId = await buildUniqueFileId(fakeContext, fileInfo.file_name, fileInfo.mime_type);
 
-                    // 构造 metadata，并打上大文件和来源标签以及消息ID和频道ID
                     const isLarge = fileInfo.file_size > 20 * 1024 * 1024;
-                    const metadata = {
-                        FileName: fileInfo.file_name,
-                        FileType: fileInfo.mime_type,
-                        FileSize: (fileInfo.file_size / 1024 / 1024).toFixed(2),
-                        FileSizeBytes: fileInfo.file_size,
-                        UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
-                        UploadAddress: 'Telegram Bot',
-                        ListType: "None",
-                        TimeStamp: Date.now(),
-                        Label: "None",
-                        Directory: "",
-                        Tags: isLarge ? ["tgbot_large"] : [],
-                        IsLargeFile: isLarge,
-                        Channel: "TelegramNew",
-                        ChannelName: tgChannel.name,
-                        TgFileId: fileInfo.file_id,
-                        TgMsgId: copyRes.result.message_id,
-                        TgChatId: targetChatId,
-                    };
+                    let metadata;
+                    let dbValue = "";
+
+                    if (isLarge) {
+                        if (msgId) {
+                            await editMessage(botToken, chatId, msgId,
+                                `⏳ 文件大于 20MB，正在下载并切片转存 <b>${escapeHtml(fileInfo.file_name)}</b> 到频道，请稍候…`,
+                                {}, proxyUrl
+                            );
+                        }
+
+                        const chunks = await downloadAndSliceTelegramFile(
+                            botToken,
+                            fileInfo.file_id,
+                            proxyUrl,
+                            targetBotToken,
+                            targetChatId,
+                            targetProxyUrl,
+                            fileInfo.file_name,
+                            fileInfo.file_size
+                        );
+
+                        dbValue = JSON.stringify(chunks);
+
+                        metadata = {
+                            FileName: fileInfo.file_name,
+                            FileType: fileInfo.mime_type,
+                            FileSize: (fileInfo.file_size / 1024 / 1024).toFixed(2),
+                            FileSizeBytes: fileInfo.file_size,
+                            UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
+                            UploadAddress: 'Telegram Bot',
+                            ListType: "None",
+                            TimeStamp: Date.now(),
+                            Label: "None",
+                            Directory: "",
+                            Tags: ["tgbot_large"],
+                            IsLargeFile: true,
+                            IsChunked: true,
+                            TotalChunks: chunks.length,
+                            Channel: "TelegramNew",
+                            ChannelName: tgChannel.name,
+                        };
+                    } else {
+                        // 直接转存（免下载）
+                        const copyRes = await copyMessage(targetBotToken, targetChatId, chatId, message.message_id, {}, targetProxyUrl);
+                        if (!copyRes.ok) {
+                            throw new Error(`Telegram API copyMessage 失败: ${copyRes.description}`);
+                        }
+
+                        metadata = {
+                            FileName: fileInfo.file_name,
+                            FileType: fileInfo.mime_type,
+                            FileSize: (fileInfo.file_size / 1024 / 1024).toFixed(2),
+                            FileSizeBytes: fileInfo.file_size,
+                            UploadIP: context.request.headers.get('CF-Connecting-IP') || '127.0.0.1',
+                            UploadAddress: 'Telegram Bot',
+                            ListType: "None",
+                            TimeStamp: Date.now(),
+                            Label: "None",
+                            Directory: "",
+                            Tags: [],
+                            IsLargeFile: false,
+                            Channel: "TelegramNew",
+                            ChannelName: tgChannel.name,
+                            TgFileId: fileInfo.file_id,
+                            TgMsgId: copyRes.result.message_id,
+                            TgChatId: targetChatId,
+                        };
+                    }
 
                     // 写入 KV 数据库
-                    await db.put(fullId, "", { metadata });
+                    await db.put(fullId, dbValue, { metadata });
 
                     // 触发结束上传的后台任务（清除缓存、增加索引）
                     context.waitUntil(endUpload(fakeContext, fullId, metadata));

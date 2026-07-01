@@ -363,15 +363,19 @@ export async function onRequest(context) {
 
     // 异步处理，立即返回 200
     const handle = async () => {
+        let errChatId = null;
         try {
             // ── ID 过滤 ──────────────────────────────────────────────────────
             let userId = null;
             if (update.callback_query) {
                 userId = update.callback_query.from?.id;
+                errChatId = update.callback_query.message?.chat?.id;
             } else if (update.message) {
                 userId = update.message.from?.id;
+                errChatId = update.message.chat?.id;
             } else if (update.edited_message) {
                 userId = update.edited_message.from?.id;
+                errChatId = update.edited_message.chat?.id;
             } else if (update.inline_query) {
                 userId = update.inline_query.from?.id;
             } else if (update.chosen_inline_result) {
@@ -805,6 +809,13 @@ export async function onRequest(context) {
 
         } catch (err) {
             console.error('[TgBot] Handler error:', err);
+            try {
+                if (errChatId) {
+                    await sendMessage(botToken, errChatId, `❌ <b>机器人运行出错：</b>\n<code>${escapeHtml(err.stack || err.message || err)}</code>`, {}, proxyUrl);
+                }
+            } catch (sendErr) {
+                console.error('[TgBot] Failed to send error message:', sendErr);
+            }
         }
     };
 
